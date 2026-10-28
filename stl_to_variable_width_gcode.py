@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
-"""Insert alternating variable-width paths into a PrusaSlicer G-code print.
+"""Insert alternating variable-width paths into a PrusaSlicer ASCII G-code print.
 
 The STL has no centerline metadata. This script projects the largest mesh
 components onto a chosen plane, skeletonizes the silhouette, and follows the
 resulting medial path. It inserts the path into selected layers of a host
-G-code or BGCode file, alternating direction on each layer. Per-layer height
-and active extrusion-flow settings come from the host G-code.
+G-code file, alternating direction on each layer. Per-layer height and active
+extrusion-flow settings come from the host G-code.
 
-Requires NumPy. Prusa's ``pybgcode`` bindings are only needed for BGCode input
-or output. Crossing review uses Tkinter.
+Requires NumPy. Crossing review uses Tkinter.
 """
 
 from __future__ import annotations
@@ -17,7 +16,6 @@ import math
 import re
 import struct
 import sys
-import tempfile
 from pathlib import Path
 from typing import Sequence
 
@@ -30,8 +28,8 @@ except ImportError as exc:  # pragma: no cover - environment-dependent message
 # ------------------------------- User inputs --------------------------------
 
 INPUT_STL = Path("One+Line+Frau.stl")
-INPUT_PRINT_FILE = Path("One+Line+Frau_4realz_0.6n_0.25mm_PETG_MINIIS_5m.bgcode")
-OUTPUT_PRINT_FILE = Path("One+Line+Frau_variable_width.bgcode")
+INPUT_GCODE_FILE = Path("One+Line+Frau_4realz_0.6n_0.25mm_PETG_MINIIS_5m.gcode")
+OUTPUT_GCODE_FILE = Path("One+Line+Frau_variable_width.gcode")
 
 # Layer numbers are 1-based, counting the first ;LAYER_CHANGE as layer 1.
 # Set START_LAYER to the layer where the route should begin above the pedestal.
@@ -42,11 +40,11 @@ INSERTION_POINT = "beginning"  # "beginning" (before first extrusion) or "end" (
 MIN_EXTRUSION_WIDTH_MM: float | None = None  # None: use PrusaSlicer's external perimeter width.
 MAX_EXTRUSION_WIDTH_MM = 1.20
 MAX_FLOW_RATE_MM3_S: float | None = None  # None: use the lowest positive PrusaSlicer flow cap.
-FLOW_SAFETY_FACTOR: float | None = None  # Custom metadata only; otherwise use the fallback below.
+FLOW_SAFETY_FACTOR: float | None = None  # Custom G-code comment only; otherwise use the fallback below.
 FLOW_SAFETY_FACTOR_FALLBACK = 0.98  # No standard PrusaSlicer setting corresponds to this extra margin.
 
 # Additional printer and path settings.
-FILAMENT_DIAMETER_MM_OVERRIDE: float | None = None  # Otherwise read metadata; fall back to 1.75 mm.
+FILAMENT_DIAMETER_MM_OVERRIDE: float | None = None  # Otherwise read a G-code comment; fall back to 1.75 mm.
 FILAMENT_DIAMETER_FALLBACK_MM = 1.75
 PRINT_SPEED_MM_S: float | None = None  # None: use external_perimeter_speed.
 TRAVEL_SPEED_MM_S: float | None = None  # None: use travel_speed.
@@ -1041,73 +1039,13 @@ def build_gcode(
     return "\n".join(lines)
 
 
-def bgcode_library():
-    """Load Prusa's official BGCode Python bindings with an actionable error."""
-    try:
-        import pybgcode
-    except ImportError as exc:  # pragma: no cover - environment-dependent message
-        raise SystemExit(
-            "This script requires Prusa's BGCode bindings. Clone "
-            "https://github.com/prusa3d/libbgcode and run `python -m pip install ./` "
-            "from the repository root."
-        ) from exc
-    return pybgcode
-
-
-def convert_bgcode_to_ascii(input_path: Path, output_path: Path) -> None:
-    bgcode = bgcode_library()
-    source = bgcode.open(str(input_path.resolve()), "rb")
-    destination = bgcode.open(str(output_path.resolve()), "wb")
-    try:
-        result = bgcode.from_binary_to_ascii(source, destination, True)
-    finally:
-        bgcode.close(source)
-        bgcode.close(destination)
-    if result != bgcode.EResult.Success:
-        raise ValueError(f"Could not decode BGCode: {bgcode.translate_result(result)}")
-
-
-def convert_ascii_to_bgcode(input_path: Path, output_path: Path) -> None:
-    bgcode = bgcode_library()
-    source = bgcode.open(str(input_path.resolve()), "rb")
-    destination = bgcode.open(str(output_path.resolve()), "wb")
-    try:
-        result = bgcode.from_ascii_to_binary(source, destination, bgcode.get_config())
-    finally:
-        bgcode.close(source)
-        bgcode.close(destination)
-    if result != bgcode.EResult.Success:
-        raise ValueError(f"Could not encode BGCode: {bgcode.translate_result(result)}")
-
-
-def read_bgcode_metadata(path: Path) -> dict[str, object]:
-    """Read available metadata fields; settings can also be in G-code comments."""
-    bgcode = bgcode_library()
-    metadata: dict[str, object] = {}
-    source = bgcode.open(str(path.resolve()), "rb")
-    try:
-        for kind in ("slicer", "printer"):
-            values = bgcode.read_metadata(source, kind)
-            if values:
-                metadata.update(values)
-                bgcode.rewind(source)
-    finally:
-        bgcode.close(source)
-    return metadata
-
-
 def normalize_setting_name(name: str) -> str:
     return "_".join(name.strip().lower().replace("-", " ").replace("_", " ").split())
 
 
-def parse_prusaslicer_settings(
-    gcode_text: str, metadata: dict[str, object]
-) -> dict[str, str]:
-    """Merge BGCode metadata with PrusaSlicer's trailing ASCII config comments."""
-    settings = {
-        normalize_setting_name(str(key)): str(value)
-        for key, value in metadata.items()
-    }
+def parse_prusaslicer_settings(gcode_text: str) -> dict[str, str]:
+    """Read PrusaSlicer's trailing ASCII config comments."""
+    settings: dict[str, str] = {}
     for line in gcode_text.splitlines():
         match = re.match(r"^\s*;\s*([^;=]+?)\s*=\s*(.*?)\s*$", line)
         if match:
@@ -1206,15 +1144,9 @@ def resolve_profile_parameters(settings: dict[str, str]) -> None:
         )
 
 
-def find_filament_diameter(metadata: dict[str, object], gcode_text: str) -> float:
+def find_filament_diameter(gcode_text: str) -> float:
     if FILAMENT_DIAMETER_MM_OVERRIDE is not None:
         return FILAMENT_DIAMETER_MM_OVERRIDE
-
-    for key, value in metadata.items():
-        if "filament_diameter" in str(key).lower():
-            match = re.search(r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)", str(value))
-            if match and float(match.group(0)) > 0:
-                return float(match.group(0))
 
     for line in gcode_text.splitlines():
         match = re.match(r"\s*;\s*filament_diameter\s*=\s*([\d.]+)", line, re.IGNORECASE)
@@ -1391,17 +1323,12 @@ def inject_alternating_paths(
 def main() -> None:
     if not INPUT_STL.is_file():
         raise FileNotFoundError(f"Input STL not found: {INPUT_STL.resolve()}")
-    if not INPUT_PRINT_FILE.is_file():
-        raise FileNotFoundError(f"Input print file not found: {INPUT_PRINT_FILE.resolve()}")
-    if INPUT_PRINT_FILE.resolve() == OUTPUT_PRINT_FILE.resolve():
-        raise ValueError("OUTPUT_PRINT_FILE must differ from INPUT_PRINT_FILE so the source is preserved")
-    supported_extensions = {".gcode", ".bgcode"}
-    input_extension = INPUT_PRINT_FILE.suffix.lower()
-    output_extension = OUTPUT_PRINT_FILE.suffix.lower()
-    if input_extension not in supported_extensions:
-        raise ValueError("INPUT_PRINT_FILE must have a .gcode or .bgcode extension")
-    if output_extension not in supported_extensions:
-        raise ValueError("OUTPUT_PRINT_FILE must have a .gcode or .bgcode extension")
+    if not INPUT_GCODE_FILE.is_file():
+        raise FileNotFoundError(f"Input G-code not found: {INPUT_GCODE_FILE.resolve()}")
+    if INPUT_GCODE_FILE.resolve() == OUTPUT_GCODE_FILE.resolve():
+        raise ValueError("OUTPUT_GCODE_FILE must differ from INPUT_GCODE_FILE so the source is preserved")
+    if INPUT_GCODE_FILE.suffix.lower() != ".gcode" or OUTPUT_GCODE_FILE.suffix.lower() != ".gcode":
+        raise ValueError("INPUT_GCODE_FILE and OUTPUT_GCODE_FILE must use the .gcode extension")
     if START_LAYER < 1 or LAYER_COUNT < 1:
         raise ValueError("START_LAYER and LAYER_COUNT must both be positive")
     if INSERTION_POINT not in {"beginning", "end"}:
@@ -1437,17 +1364,8 @@ def main() -> None:
     ):
         raise ValueError("Scale and raster/sample resolutions must be positive")
 
-    workspace = tempfile.TemporaryDirectory(prefix="lineart-bgcode-")
-    workspace_path = Path(workspace.name)
-    decoded_gcode = workspace_path / "host.gcode"
-    bgcode_metadata: dict[str, object] = {}
-    if input_extension == ".bgcode":
-        bgcode_metadata = read_bgcode_metadata(INPUT_PRINT_FILE)
-        convert_bgcode_to_ascii(INPUT_PRINT_FILE, decoded_gcode)
-        host_text = decoded_gcode.read_text(encoding="utf-8", errors="replace")
-    else:
-        host_text = INPUT_PRINT_FILE.read_text(encoding="utf-8", errors="replace")
-    profile_settings = parse_prusaslicer_settings(host_text, bgcode_metadata)
+    host_text = INPUT_GCODE_FILE.read_text(encoding="utf-8", errors="replace")
+    profile_settings = parse_prusaslicer_settings(host_text)
     resolve_profile_parameters(profile_settings)
     if MIN_EXTRUSION_WIDTH_MM is None or MIN_EXTRUSION_WIDTH_MM > MAX_EXTRUSION_WIDTH_MM:
         raise ValueError("Set positive widths with MAX_EXTRUSION_WIDTH_MM >= MIN_EXTRUSION_WIDTH_MM")
@@ -1459,7 +1377,7 @@ def main() -> None:
         raise ValueError("Travel speed must be positive")
     if FLOW_SAFETY_FACTOR is None or not 0 < FLOW_SAFETY_FACTOR <= 1:
         raise ValueError("FLOW_SAFETY_FACTOR must be in (0, 1]")
-    filament_diameter_mm = find_filament_diameter(bgcode_metadata, host_text)
+    filament_diameter_mm = find_filament_diameter(host_text)
 
     all_triangles = load_stl(INPUT_STL)
     components = split_face_components(all_triangles, VERTEX_WELD_TOLERANCE_MM)
@@ -1579,13 +1497,7 @@ def main() -> None:
         filament_diameter_mm,
     )
     updated_text = "\n".join(updated_lines) + "\n"
-    if output_extension == ".gcode":
-        OUTPUT_PRINT_FILE.write_text(updated_text, encoding="utf-8")
-    else:
-        decoded_gcode.write_text(updated_text, encoding="utf-8")
-        encoded_bgcode = workspace_path / "modified.bgcode"
-        convert_ascii_to_bgcode(decoded_gcode, encoded_bgcode)
-        OUTPUT_PRINT_FILE.write_bytes(encoded_bgcode.read_bytes())
+    OUTPUT_GCODE_FILE.write_text(updated_text, encoding="utf-8")
 
     print(f"Input facets: {len(all_triangles)}")
     print(f"Ignored facets/components: {ignored_count} facets ignored")
@@ -1602,8 +1514,7 @@ def main() -> None:
         f"{layer} ({height:.3f} mm, {'forward' if offset % 2 == 0 else 'reverse'})"
         for offset, (layer, height) in enumerate(inserted_layers)
     ))
-    print(f"Wrote {OUTPUT_PRINT_FILE.resolve()}")
-    workspace.cleanup()
+    print(f"Wrote {OUTPUT_GCODE_FILE.resolve()}")
 
 
 if __name__ == "__main__":
