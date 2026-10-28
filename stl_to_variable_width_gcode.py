@@ -1,19 +1,23 @@
 #!/usr/bin/env python3
-"""Convert a swept-line STL into two direction-reversed, variable-width G-code paths.
+"""Insert alternating variable-width paths into a PrusaSlicer G-code print.
 
 The STL has no centerline metadata. This script projects the largest mesh
 components onto a chosen plane, skeletonizes the silhouette, and follows the
-resulting medial path. It writes relative-E extrusion moves and deliberately
-omits all Z moves so the snippets can be inserted at an existing layer.
+resulting medial path. It inserts the path into selected layers of a host
+G-code or BGCode file, alternating direction on each layer. Per-layer height
+and active extrusion-flow settings come from the host G-code.
 
-Requires NumPy: ``python -m pip install numpy``.
+Requires NumPy. Prusa's ``pybgcode`` bindings are only needed for BGCode input
+or output. Crossing review uses Tkinter.
 """
 
 from __future__ import annotations
 
 import math
+import re
 import struct
 import sys
+import tempfile
 from pathlib import Path
 from typing import Sequence
 
@@ -25,20 +29,27 @@ except ImportError as exc:  # pragma: no cover - environment-dependent message
 
 # ------------------------------- User inputs --------------------------------
 
-INPUT_FILE = Path("One+Line+Frau.stl")
-OUTPUT_FORWARD = Path("One+Line+Frau_forward.gcode")
-OUTPUT_REVERSE = Path("One+Line+Frau_reverse.gcode")
+INPUT_STL = Path("One+Line+Frau.stl")
+INPUT_PRINT_FILE = Path("One+Line+Frau_4realz_0.6n_0.25mm_PETG_MINIIS_5m.bgcode")
+OUTPUT_PRINT_FILE = Path("One+Line+Frau_variable_width.bgcode")
 
-MIN_EXTRUSION_WIDTH_MM = 0.65
+# Layer numbers are 1-based, counting the first ;LAYER_CHANGE as layer 1.
+# Set START_LAYER to the layer where the route should begin above the pedestal.
+START_LAYER = 1
+LAYER_COUNT = 4
+INSERTION_POINT = "beginning"  # "beginning" (before first extrusion) or "end" (after layer toolpaths)
+
+MIN_EXTRUSION_WIDTH_MM: float | None = None  # None: use PrusaSlicer's external perimeter width.
 MAX_EXTRUSION_WIDTH_MM = 1.20
-EXTRUSION_HEIGHT_MM = 0.30
-MAX_FLOW_RATE_MM3_S = 8.0
-FLOW_SAFETY_FACTOR = 0.98  # Allow for rounded E/F values in the emitted G-code.
+MAX_FLOW_RATE_MM3_S: float | None = None  # None: use the lowest positive PrusaSlicer flow cap.
+FLOW_SAFETY_FACTOR: float | None = None  # Custom metadata only; otherwise use the fallback below.
+FLOW_SAFETY_FACTOR_FALLBACK = 0.98  # No standard PrusaSlicer setting corresponds to this extra margin.
 
 # Additional printer and path settings.
-FILAMENT_DIAMETER_MM = 1.75
-PRINT_SPEED_MM_S = 40.0
-TRAVEL_SPEED_MM_S = 120.0
+FILAMENT_DIAMETER_MM_OVERRIDE: float | None = None  # Otherwise read metadata; fall back to 1.75 mm.
+FILAMENT_DIAMETER_FALLBACK_MM = 1.75
+PRINT_SPEED_MM_S: float | None = None  # None: use external_perimeter_speed.
+TRAVEL_SPEED_MM_S: float | None = None  # None: use travel_speed.
 # Maximum centerline gap the script may connect. This is separate from the
 # bead-width limits: connectors are printed at a capped width. Lower it if you
 # want the script to reject uncertain joins rather than bridge them.
@@ -50,6 +61,8 @@ WIDTH_SIMPLIFY_TOLERANCE_MM = 0.08
 SPUR_PRUNE_LENGTH_MM = 0.60
 VERTEX_WELD_TOLERANCE_MM = 0.001
 IGNORE_COMPONENTS_BELOW_TRIANGLES = 100
+REVIEW_CROSSINGS_GRAPHICALLY = True
+ARM_PREVIEW_LENGTH_MM = 8.0
 
 # The line art is viewed along STL X, so STL Y/Z become printer X/Y. Change
 # these axes if the model uses a different drawing plane. The coordinates are
@@ -60,9 +73,8 @@ OUTPUT_CENTER_X_MM = 110.0
 OUTPUT_CENTER_Y_MM = 110.0
 OUTPUT_SCALE = 1.0
 
-# A conventional 220 x 220 mm bed is assumed for the default output center.
-# G-code uses absolute XY (G90) and relative extrusion (M83); the snippet does
-# not change either mode because it cannot safely restore unknown host state.
+# The inserted path uses absolute XY and relative E. The script checks these
+# modes at each insertion point and compensates for the host's active M221 flow.
 
 
 # ------------------------------ STL handling --------------------------------
@@ -388,6 +400,234 @@ def bresenham(a: tuple[int, int], b: tuple[int, int]) -> list[tuple[int, int]]:
     return result
 
 
+def trace_arm(
+    junction: int,
+    first_neighbor: int,
+    coordinates: Sequence[tuple[int, int]],
+    adjacency: Sequence[Sequence[int]],
+    max_length_px: float,
+) -> list[int]:
+    """Trace one visible branch away from a junction for the review view."""
+    path = [junction, first_neighbor]
+    previous, current = junction, first_neighbor
+    length = math.dist(coordinates[previous], coordinates[current])
+    while length < max_length_px and len(adjacency[current]) == 2:
+        options = [node for node in adjacency[current] if node != previous]
+        if not options:
+            break
+        following = options[0]
+        if following == junction:
+            break
+        length += math.dist(coordinates[current], coordinates[following])
+        path.append(following)
+        previous, current = current, following
+    return path
+
+
+def review_crossing_pairings(
+    skeleton: np.ndarray,
+    coordinates: Sequence[tuple[int, int]],
+    adjacency: Sequence[Sequence[int]],
+    junction_nodes: Sequence[int],
+    pixels_per_mm: float,
+) -> dict[int, list[tuple[int, int]]]:
+    """Show each skeleton junction and let the user pair its visible arms."""
+    if not junction_nodes:
+        return {}
+    try:
+        import tkinter as tk
+    except ImportError as exc:  # pragma: no cover - platform-dependent
+        raise SystemExit("Crossing review requires Tkinter. Install the system python3-tk package.") from exc
+
+    palette = (
+        "#ff6b6b", "#4dabf7", "#69db7c", "#ffd43b", "#b197fc", "#38d9a9",
+        "#f783ac", "#ffa94d", "#74c0fc", "#a9e34b", "#e599f7", "#66d9e8",
+    )
+    decisions: dict[int, list[tuple[int, int]]] = {}
+    try:
+        root = tk.Tk()
+        root.withdraw()
+    except tk.TclError as exc:  # pragma: no cover - requires a desktop display
+        raise SystemExit(f"Could not open the crossing review window: {exc}") from exc
+
+    cancelled = False
+    for crossing_index, junction in enumerate(junction_nodes, start=1):
+        arms = [
+            trace_arm(
+                junction,
+                neighbor,
+                coordinates,
+                adjacency,
+                ARM_PREVIEW_LENGTH_MM * pixels_per_mm,
+            )
+            for neighbor in adjacency[junction]
+        ]
+        if len(arms) < 3:
+            continue
+        window = tk.Toplevel(root)
+        window.title(f"Crossing {crossing_index} of {len(junction_nodes)}")
+        window.geometry("850x700")
+        window.transient(root)
+
+        heading = tk.Label(
+            window,
+            text=(
+                f"Crossing {crossing_index} of {len(junction_nodes)} — "
+                f"{len(arms)} line ends. Click two colored tips to connect them."
+            ),
+            font=("TkDefaultFont", 12, "bold"),
+            pady=8,
+        )
+        heading.pack(fill="x")
+        instruction = tk.Label(
+            window,
+            text="Pair all continuing arms you recognize, then Continue. Unpaired arms use the route fallback.",
+            pady=3,
+        )
+        instruction.pack(fill="x")
+        canvas = tk.Canvas(window, width=820, height=570, bg="#111827", highlightthickness=0)
+        canvas.pack(padx=12, pady=8, fill="both", expand=True)
+        footer = tk.Frame(window)
+        footer.pack(fill="x", padx=12, pady=(0, 12))
+        state: dict[str, object] = {"selected": [], "pairs": [], "markers": []}
+        completed = [False]
+
+        all_visible = [node for arm in arms for node in arm]
+        rows = [coordinates[node][0] for node in all_visible]
+        cols = [coordinates[node][1] for node in all_visible]
+        margin = max(12.0, 2.5 * pixels_per_mm)
+        min_row, max_row = min(rows) - margin, max(rows) + margin
+        min_col, max_col = min(cols) - margin, max(cols) + margin
+        canvas_w, canvas_h = 820.0, 570.0
+        scale = min(
+            (canvas_w - 48.0) / max(1.0, max_col - min_col),
+            (canvas_h - 48.0) / max(1.0, max_row - min_row),
+        )
+        offset_x = (canvas_w - (max_col - min_col) * scale) * 0.5
+        offset_y = (canvas_h - (max_row - min_row) * scale) * 0.5
+
+        def screen(node: int) -> tuple[float, float]:
+            row, col = coordinates[node]
+            return offset_x + (col - min_col) * scale, offset_y + (row - min_row) * scale
+
+        def redraw() -> None:
+            canvas.delete("all")
+            # Low-contrast local skeleton gives the user context around the arms.
+            r0, r1 = max(0, int(min_row)), min(skeleton.shape[0] - 1, int(max_row))
+            c0, c1 = max(0, int(min_col)), min(skeleton.shape[1] - 1, int(max_col))
+            for node, (row, col) in enumerate(coordinates):
+                if not (r0 <= row <= r1 and c0 <= col <= c1):
+                    continue
+                x0, y0 = screen(node)
+                for neighbor in adjacency[node]:
+                    if neighbor <= node:
+                        continue
+                    rr, cc = coordinates[neighbor]
+                    if r0 <= rr <= r1 and c0 <= cc <= c1:
+                        x1, y1 = screen(neighbor)
+                        canvas.create_line(x0, y0, x1, y1, fill="#526071", width=2)
+
+            marker_points: list[tuple[float, float]] = []
+            pairs = state["pairs"]
+            selected = state["selected"]
+            assert isinstance(pairs, list) and isinstance(selected, list)
+            paired_arms = {arm_id for pair in pairs for arm_id in pair}
+            for arm_id, arm in enumerate(arms):
+                color = palette[arm_id % len(palette)]
+                arm_points = [screen(node) for node in arm]
+                for first, second in zip(arm_points, arm_points[1:]):
+                    canvas.create_line(*first, *second, fill=color, width=5, capstyle="round")
+                tip_x, tip_y = arm_points[-1]
+                marker_points.append((tip_x, tip_y))
+                radius = 12 if arm_id not in paired_arms else 9
+                outline = "#ffffff" if arm_id in selected else color
+                canvas.create_oval(
+                    tip_x - radius, tip_y - radius, tip_x + radius, tip_y + radius,
+                    fill="#111827", outline=outline, width=3,
+                )
+                canvas.create_text(
+                    tip_x, tip_y, text=chr(65 + arm_id), fill="#ffffff",
+                    font=("TkDefaultFont", 10, "bold"),
+                )
+            for first_arm, second_arm in pairs:
+                x0, y0 = marker_points[first_arm]
+                x1, y1 = marker_points[second_arm]
+                canvas.create_line(x0, y0, x1, y1, fill="#f8f9fa", width=2, dash=(6, 4))
+            x, y = screen(junction)
+            canvas.create_oval(x - 7, y - 7, x + 7, y + 7, fill="#ffffff", outline="#111827", width=2)
+            marker_state = state["markers"]
+            assert isinstance(marker_state, list)
+            marker_state.clear()
+            marker_state.extend(marker_points)
+
+        def on_click(event: object) -> None:
+            x, y = float(event.x), float(event.y)  # type: ignore[attr-defined]
+            marker_points = state["markers"]
+            selected = state["selected"]
+            pairs = state["pairs"]
+            assert isinstance(marker_points, list) and isinstance(selected, list) and isinstance(pairs, list)
+            if not marker_points:
+                return
+            arm_id = min(range(len(marker_points)), key=lambda i: math.dist(marker_points[i], (x, y)))
+            if math.dist(marker_points[arm_id], (x, y)) > 24:
+                return
+            if any(arm_id in pair for pair in pairs):
+                return
+            if arm_id in selected:
+                selected.remove(arm_id)
+            else:
+                selected.append(arm_id)
+            if len(selected) == 2:
+                pairs.append(tuple(selected))
+                selected.clear()
+            redraw()
+
+        def undo_pair() -> None:
+            selected = state["selected"]
+            pairs = state["pairs"]
+            assert isinstance(selected, list) and isinstance(pairs, list)
+            if selected:
+                selected.clear()
+            elif pairs:
+                pairs.pop()
+            redraw()
+
+        def clear_pairs() -> None:
+            selected = state["selected"]
+            pairs = state["pairs"]
+            assert isinstance(selected, list) and isinstance(pairs, list)
+            selected.clear()
+            pairs.clear()
+            redraw()
+
+        def finish() -> None:
+            completed[0] = True
+            window.destroy()
+
+        def cancel() -> None:
+            nonlocal cancelled
+            cancelled = True
+            window.destroy()
+
+        canvas.bind("<Button-1>", on_click)
+        tk.Button(footer, text="Undo pair", command=undo_pair).pack(side="left")
+        tk.Button(footer, text="Clear", command=clear_pairs).pack(side="left", padx=6)
+        tk.Button(footer, text="Continue", command=finish).pack(side="right")
+        window.protocol("WM_DELETE_WINDOW", cancel)
+        redraw()
+        root.wait_window(window)
+        if cancelled:
+            root.destroy()
+            raise SystemExit("Crossing review canceled; no G-code snippets were written.")
+        if completed[0]:
+            pairs = state["pairs"]
+            assert isinstance(pairs, list)
+            decisions[junction] = [(arms[a][1], arms[b][1]) for a, b in pairs]
+
+    root.destroy()
+    return decisions
+
+
 def connect_nearby_components(
     skeleton: np.ndarray,
     distance: np.ndarray,
@@ -458,6 +698,7 @@ def connect_nearby_components(
 def route_eulerian(
     coordinates: Sequence[tuple[int, int]],
     adjacency: Sequence[Sequence[int]],
+    junction_pairings: dict[int, list[tuple[int, int]]],
     bottom_start: bool,
     distance: np.ndarray,
     pixels_per_mm: float,
@@ -546,52 +787,94 @@ def route_eulerian(
 
     if not all_edges:
         raise ValueError("The skeleton graph has no printable edges")
-    remaining_odd = [node for node, edge_ids in enumerate(edge_adjacency) if len(edge_ids) % 2]
-    if remaining_odd:
-        bottom_endpoints = sorted(remaining_odd, key=lambda n: coordinates[n][0], reverse=True)
-        start = bottom_endpoints[0] if bottom_start else remaining_odd[0]
-    else:
-        start = max(range(len(coordinates)), key=lambda n: coordinates[n][0]) if bottom_start else 0
+    # Turn each user's local arm choice into a fixed pairing of incident edges.
+    # Remaining arms are paired by their straightest continuation. This makes
+    # the selected crossing connections part of the route itself rather than a
+    # loose preference during edge traversal.
+    base_edge_by_pair = {
+        (min(first, second), max(first, second)): edge_id
+        for edge_id, (first, second) in enumerate(base_edges)
+    }
+    transitions: dict[tuple[int, int], int] = {}
+    open_half_edges: list[tuple[int, int]] = []
+    for node, incident_edges in enumerate(edge_adjacency):
+        remaining = set(incident_edges)
+        for first_arm, second_arm in junction_pairings.get(node, []):
+            first_edge = base_edge_by_pair.get((min(node, first_arm), max(node, first_arm)))
+            second_edge = base_edge_by_pair.get((min(node, second_arm), max(node, second_arm)))
+            if first_edge is None or second_edge is None or first_edge == second_edge:
+                raise ValueError(f"Invalid crossing-arm selection at skeleton node {node}")
+            if first_edge not in remaining or second_edge not in remaining:
+                raise ValueError(f"A line end was paired more than once at skeleton node {node}")
+            transitions[(node, first_edge)] = second_edge
+            transitions[(node, second_edge)] = first_edge
+            remaining.remove(first_edge)
+            remaining.remove(second_edge)
 
-    visited = bytearray(len(all_edges))
-    stack_nodes = [start]
-    stack_edges: list[int] = []
-    reverse_nodes: list[int] = []
-    reverse_edges: list[int] = []
-    while stack_nodes:
-        node = stack_nodes[-1]
-        available = [edge_id for edge_id in edge_adjacency[node] if not visited[edge_id]]
-        if available:
-            previous_node = stack_nodes[-2] if len(stack_nodes) > 1 else None
-
-            def continuation_score(edge_id: int) -> float:
-                a, b = all_edges[edge_id]
-                neighbor = b if a == node else a
-                if previous_node is None:
-                    return 0.0
-                r0, c0 = coordinates[previous_node]
-                r1, c1 = coordinates[node]
-                r2, c2 = coordinates[neighbor]
-                incoming = (r1 - r0, c1 - c0)
-                outgoing = (r2 - r1, c2 - c1)
-                denom = math.hypot(*incoming) * math.hypot(*outgoing) or 1.0
-                return -(incoming[0] * outgoing[0] + incoming[1] * outgoing[1]) / denom
-
-            edge_id = min(available, key=continuation_score)
-            visited[edge_id] = 1
+        def outward_vector(edge_id: int) -> tuple[float, float]:
             first, second = all_edges[edge_id]
             neighbor = second if first == node else first
-            stack_nodes.append(neighbor)
-            stack_edges.append(edge_id)
-        else:
-            reverse_nodes.append(stack_nodes.pop())
-            if stack_edges:
-                reverse_edges.append(stack_edges.pop())
+            row, col = coordinates[node]
+            next_row, next_col = coordinates[neighbor]
+            length = math.hypot(next_row - row, next_col - col) or 1.0
+            return (next_row - row) / length, (next_col - col) / length
 
-    if not all(visited):
-        raise ValueError("The skeleton graph is disconnected after gap bridging")
-    nodes = list(reversed(reverse_nodes))
-    edge_ids = list(reversed(reverse_edges))
+        while len(remaining) >= 2:
+            best_pair: tuple[float, int, int] | None = None
+            for first_edge in remaining:
+                first_vector = outward_vector(first_edge)
+                for second_edge in remaining:
+                    if second_edge <= first_edge:
+                        continue
+                    second_vector = outward_vector(second_edge)
+                    # Opposing outward directions make a smooth continuation.
+                    score = first_vector[0] * second_vector[0] + first_vector[1] * second_vector[1]
+                    if best_pair is None or score < best_pair[0]:
+                        best_pair = (score, first_edge, second_edge)
+            assert best_pair is not None
+            _, first_edge, second_edge = best_pair
+            transitions[(node, first_edge)] = second_edge
+            transitions[(node, second_edge)] = first_edge
+            remaining.remove(first_edge)
+            remaining.remove(second_edge)
+        if remaining:
+            open_half_edges.append((node, remaining.pop()))
+
+    if len(open_half_edges) not in (0, 2):
+        raise ValueError(
+            f"The selected crossing pairings leave {len(open_half_edges)} open line ends. "
+            "Pair more arms in the review windows so the result forms one route."
+        )
+
+    if open_half_edges:
+        start_node, first_edge = max(
+            open_half_edges,
+            key=lambda half_edge: coordinates[half_edge[0]][0] if bottom_start else -coordinates[half_edge[0]][0],
+        )
+    else:
+        start_node = max(range(len(coordinates)), key=lambda n: coordinates[n][0]) if bottom_start else 0
+        first_edge = min(edge_adjacency[start_node])
+
+    visited: set[int] = set()
+    nodes = [start_node]
+    edge_ids: list[int] = []
+    current_node, current_edge = start_node, first_edge
+    while current_edge not in visited:
+        visited.add(current_edge)
+        first, second = all_edges[current_edge]
+        next_node = second if first == current_node else first
+        edge_ids.append(current_edge)
+        nodes.append(next_node)
+        next_edge = transitions.get((next_node, current_edge))
+        if next_edge is None or next_edge in visited:
+            break
+        current_node, current_edge = next_node, next_edge
+
+    if len(visited) != len(all_edges):
+        raise ValueError(
+            "The selected crossing connections create multiple separate trails. "
+            "Adjust the arm pairings and run the script again."
+        )
     segment_multiplicity = [1] * len(edge_ids)
     segment_widths = [all_edge_bridge_widths[edge_id] for edge_id in edge_ids]
     return nodes, edge_ids, segment_multiplicity, segment_widths, len(virtual_edges)
@@ -714,19 +997,22 @@ def build_gcode(
     segment_multiplicity: Sequence[int],
     bridge_count: int,
     direction: str,
+    layer_height_mm: float,
+    flow_multiplier_percent: float,
+    filament_diameter_mm: float,
 ) -> str:
     if direction == "reverse":
         points = list(reversed(points))
         widths = list(reversed(widths))
         segment_multiplicity = list(reversed(segment_multiplicity))
 
-    filament_area = math.pi * (FILAMENT_DIAMETER_MM * 0.5) ** 2
+    filament_area = math.pi * (filament_diameter_mm * 0.5) ** 2
     travel_feed = int(round(TRAVEL_SPEED_MM_S * 60.0))
     lines = [
+        "; BEGIN VARIABLE_WIDTH_LINEART",
         f"; {name} — {direction} direction",
-        "; Z is omitted: insert at the desired layer height.",
-        "; Requires absolute XY (G90) and relative extrusion (M83) to be active.",
-        f"; Speed target {PRINT_SPEED_MM_S:.2f} mm/s; flow capped at {MAX_FLOW_RATE_MM3_S:.3f} mm^3/s; bridges: {bridge_count}.",
+        f"; Layer height {layer_height_mm:.4f} mm; host flow multiplier {flow_multiplier_percent:.2f}%.",
+        f"; Speed target {PRINT_SPEED_MM_S:.2f} mm/s; max flow {MAX_FLOW_RATE_MM3_S:.3f} mm^3/s; bridges: {bridge_count}.",
         f"G0 X{points[0][0]:.3f} Y{points[0][1]:.3f} F{travel_feed}",
     ]
 
@@ -737,32 +1023,409 @@ def build_gcode(
         if length < 1e-6:
             continue
         width = max(MIN_EXTRUSION_WIDTH_MM, min(MAX_EXTRUSION_WIDTH_MM, (widths[index] + widths[index + 1]) * 0.5))
-        area = bead_area(width, EXTRUSION_HEIGHT_MM)
+        area = bead_area(width, layer_height_mm)
         passes = max(1, segment_multiplicity[index])
         if passes > 1:
             shared_area = area / passes
-            minimum_area = bead_area(MIN_EXTRUSION_WIDTH_MM, EXTRUSION_HEIGHT_MM)
+            minimum_area = bead_area(MIN_EXTRUSION_WIDTH_MM, layer_height_mm)
             area = max(shared_area, minimum_area)
         speed = min(PRINT_SPEED_MM_S, MAX_FLOW_RATE_MM3_S * FLOW_SAFETY_FACTOR / area)
-        e_delta = area * length / filament_area
+        # M221 scales commanded E at the printer. Divide by its multiplier to
+        # preserve the intended bead volume when the host has e.g. M221 S95.
+        e_delta = area * length / (filament_area * (flow_multiplier_percent / 100.0))
         lines.append(
             f"G1 X{x1:.3f} Y{y1:.3f} E{e_delta:.5f} F{int(math.floor(speed * 60.0))}"
         )
+    lines.append("; END VARIABLE_WIDTH_LINEART")
     lines.append("")
     return "\n".join(lines)
 
 
+def bgcode_library():
+    """Load Prusa's official BGCode Python bindings with an actionable error."""
+    try:
+        import pybgcode
+    except ImportError as exc:  # pragma: no cover - environment-dependent message
+        raise SystemExit(
+            "This script requires Prusa's BGCode bindings. Clone "
+            "https://github.com/prusa3d/libbgcode and run `python -m pip install ./` "
+            "from the repository root."
+        ) from exc
+    return pybgcode
+
+
+def convert_bgcode_to_ascii(input_path: Path, output_path: Path) -> None:
+    bgcode = bgcode_library()
+    source = bgcode.open(str(input_path.resolve()), "rb")
+    destination = bgcode.open(str(output_path.resolve()), "wb")
+    try:
+        result = bgcode.from_binary_to_ascii(source, destination, True)
+    finally:
+        bgcode.close(source)
+        bgcode.close(destination)
+    if result != bgcode.EResult.Success:
+        raise ValueError(f"Could not decode BGCode: {bgcode.translate_result(result)}")
+
+
+def convert_ascii_to_bgcode(input_path: Path, output_path: Path) -> None:
+    bgcode = bgcode_library()
+    source = bgcode.open(str(input_path.resolve()), "rb")
+    destination = bgcode.open(str(output_path.resolve()), "wb")
+    try:
+        result = bgcode.from_ascii_to_binary(source, destination, bgcode.get_config())
+    finally:
+        bgcode.close(source)
+        bgcode.close(destination)
+    if result != bgcode.EResult.Success:
+        raise ValueError(f"Could not encode BGCode: {bgcode.translate_result(result)}")
+
+
+def read_bgcode_metadata(path: Path) -> dict[str, object]:
+    """Read available metadata fields; settings can also be in G-code comments."""
+    bgcode = bgcode_library()
+    metadata: dict[str, object] = {}
+    source = bgcode.open(str(path.resolve()), "rb")
+    try:
+        for kind in ("slicer", "printer"):
+            values = bgcode.read_metadata(source, kind)
+            if values:
+                metadata.update(values)
+                bgcode.rewind(source)
+    finally:
+        bgcode.close(source)
+    return metadata
+
+
+def normalize_setting_name(name: str) -> str:
+    return "_".join(name.strip().lower().replace("-", " ").replace("_", " ").split())
+
+
+def parse_prusaslicer_settings(
+    gcode_text: str, metadata: dict[str, object]
+) -> dict[str, str]:
+    """Merge BGCode metadata with PrusaSlicer's trailing ASCII config comments."""
+    settings = {
+        normalize_setting_name(str(key)): str(value)
+        for key, value in metadata.items()
+    }
+    for line in gcode_text.splitlines():
+        match = re.match(r"^\s*;\s*([^;=]+?)\s*=\s*(.*?)\s*$", line)
+        if match:
+            settings[normalize_setting_name(match.group(1))] = match.group(2)
+    return settings
+
+
+def first_setting_number(settings: dict[str, str], *names: str) -> float | None:
+    """Read the first number from a scalar or comma-separated slicer setting."""
+    for name in names:
+        value = settings.get(normalize_setting_name(name))
+        if value is None:
+            continue
+        match = re.search(r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)", value)
+        if match:
+            return float(match.group(0))
+    return None
+
+
+def first_positive_setting_number(settings: dict[str, str], *names: str) -> float | None:
+    for name in names:
+        value = first_setting_number(settings, name)
+        if value is not None and value > 0:
+            return value
+    return None
+
+
+def resolve_profile_parameters(settings: dict[str, str]) -> None:
+    """Fill automatic extrusion settings from PrusaSlicer's exported config."""
+    global MIN_EXTRUSION_WIDTH_MM
+    global MAX_FLOW_RATE_MM3_S
+    global FLOW_SAFETY_FACTOR
+    global PRINT_SPEED_MM_S
+    global TRAVEL_SPEED_MM_S
+
+    if MIN_EXTRUSION_WIDTH_MM is None:
+        MIN_EXTRUSION_WIDTH_MM = first_positive_setting_number(
+            settings,
+            "external_perimeter_extrusion_width",
+            "external_perimeters_extrusion_width",
+            "extrusion_width",
+        )
+        if MIN_EXTRUSION_WIDTH_MM is None or MIN_EXTRUSION_WIDTH_MM <= 0:
+            raise ValueError(
+                "Could not find a positive external perimeter width in the PrusaSlicer settings. "
+                "Set MIN_EXTRUSION_WIDTH_MM explicitly at the top of the script."
+            )
+
+    if MAX_FLOW_RATE_MM3_S is None:
+        flow_limits = [
+            value
+            for value in (
+                first_setting_number(settings, "filament_max_volumetric_speed"),
+                first_setting_number(settings, "max_volumetric_speed"),
+            )
+            if value is not None and value > 0
+        ]
+        if not flow_limits:
+            raise ValueError(
+                "Could not find a positive filament_max_volumetric_speed or max_volumetric_speed "
+                "in the PrusaSlicer settings. Set MAX_FLOW_RATE_MM3_S explicitly."
+            )
+        MAX_FLOW_RATE_MM3_S = min(flow_limits)
+
+    if PRINT_SPEED_MM_S is None:
+        external_speed = settings.get("external_perimeter_speed", "")
+        if external_speed:
+            speed_value = first_setting_number(settings, "external_perimeter_speed")
+            if speed_value is not None and speed_value > 0:
+                if "%" in external_speed:
+                    baseline = first_setting_number(settings, "perimeter_speed", "max_print_speed")
+                    if baseline is not None and baseline > 0:
+                        PRINT_SPEED_MM_S = baseline * speed_value / 100.0
+                else:
+                    PRINT_SPEED_MM_S = speed_value
+        if PRINT_SPEED_MM_S is None:
+            PRINT_SPEED_MM_S = first_setting_number(settings, "perimeter_speed", "max_print_speed")
+        if PRINT_SPEED_MM_S is None or PRINT_SPEED_MM_S <= 0:
+            raise ValueError(
+                "Could not find external_perimeter_speed or perimeter_speed in the PrusaSlicer settings. "
+                "Set PRINT_SPEED_MM_S explicitly."
+            )
+
+    if TRAVEL_SPEED_MM_S is None:
+        TRAVEL_SPEED_MM_S = first_setting_number(settings, "travel_speed")
+        if TRAVEL_SPEED_MM_S is None or TRAVEL_SPEED_MM_S <= 0:
+            raise ValueError(
+                "Could not find travel_speed in the PrusaSlicer settings. "
+                "Set TRAVEL_SPEED_MM_S explicitly."
+            )
+
+    if FLOW_SAFETY_FACTOR is None:
+        custom_margin = first_setting_number(settings, "flow_safety_factor")
+        FLOW_SAFETY_FACTOR = (
+            custom_margin if custom_margin is not None else FLOW_SAFETY_FACTOR_FALLBACK
+        )
+
+
+def find_filament_diameter(metadata: dict[str, object], gcode_text: str) -> float:
+    if FILAMENT_DIAMETER_MM_OVERRIDE is not None:
+        return FILAMENT_DIAMETER_MM_OVERRIDE
+
+    for key, value in metadata.items():
+        if "filament_diameter" in str(key).lower():
+            match = re.search(r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)", str(value))
+            if match and float(match.group(0)) > 0:
+                return float(match.group(0))
+
+    for line in gcode_text.splitlines():
+        match = re.match(r"\s*;\s*filament_diameter\s*=\s*([\d.]+)", line, re.IGNORECASE)
+        if match and float(match.group(1)) > 0:
+            return float(match.group(1))
+    return FILAMENT_DIAMETER_FALLBACK_MM
+
+
+def remove_previous_lineart(lines: Sequence[str]) -> list[str]:
+    """Make reruns replace this tool's marked blocks instead of stacking them."""
+    result: list[str] = []
+    i = 0
+    while i < len(lines):
+        line = lines[i].strip()
+        if line == "; BEGIN VARIABLE_WIDTH_LINEART":
+            end = i + 1
+            while end < len(lines) and lines[end].strip() != "; END VARIABLE_WIDTH_LINEART":
+                end += 1
+            if end == len(lines):
+                raise ValueError("Found an unterminated generated line-art block in the input G-code")
+            i = end + 1
+            continue
+
+        legacy_header = re.match(r"^;\s+.+\s+—\s+(?:forward|reverse)\s+direction\s*$", line)
+        legacy_comment = (
+            i + 1 < len(lines)
+            and "Z is omitted: insert at the desired layer height." in lines[i + 1]
+        )
+        if legacy_header and legacy_comment:
+            # Previous script versions emitted an unmarked one-layer snippet.
+            # Its generated moves occupied the remainder of that layer.
+            i += 2
+            while i < len(lines) and not re.match(r"^\s*;\s*LAYER_CHANGE\b", lines[i], re.IGNORECASE):
+                i += 1
+            continue
+
+        result.append(lines[i])
+        i += 1
+    return result
+
+
+def layer_sections(lines: Sequence[str]) -> list[tuple[int, int, float | None]]:
+    starts = [
+        i for i, line in enumerate(lines)
+        if re.match(r"^\s*;\s*LAYER_CHANGE\b", line, re.IGNORECASE)
+    ]
+    sections: list[tuple[int, int, float | None]] = []
+    for i, start in enumerate(starts):
+        end = starts[i + 1] if i + 1 < len(starts) else len(lines)
+        height = None
+        for line in lines[start:end]:
+            match = re.match(r"^\s*;\s*HEIGHT\s*:\s*([\d.]+)", line, re.IGNORECASE)
+            if match:
+                height = float(match.group(1))
+                break
+        sections.append((start, end, height))
+    return sections
+
+
+def host_extrusion_state(lines: Sequence[str], stop: int) -> float:
+    """Return M221 flow and ensure supported coordinate/extrusion modes."""
+    absolute_xy: bool | None = None
+    relative_e: bool | None = None
+    millimeters: bool | None = None
+    flow_percent = 100.0
+
+    for line in lines[:stop]:
+        command = line.split(";", 1)[0].strip().upper()
+        if not command:
+            continue
+        words = command.split()
+        opcode = words[0]
+        if opcode == "G90":
+            absolute_xy = True
+        elif opcode == "G91":
+            absolute_xy = False
+        elif opcode == "G21":
+            millimeters = True
+        elif opcode == "G20":
+            millimeters = False
+        elif opcode == "M83":
+            relative_e = True
+        elif opcode == "M82":
+            relative_e = False
+        elif opcode == "M221":
+            match = re.search(r"(?:^|\s)S([-+]?[\d.]+)", command)
+            if match:
+                flow_percent = float(match.group(1))
+
+    if absolute_xy is not True or relative_e is not True or millimeters is not True:
+        raise ValueError(
+            "The host G-code must use millimeter units, absolute XY (G90), and relative extrusion (M83) "
+            "at the layer insertion point."
+        )
+    if flow_percent <= 0:
+        raise ValueError(f"Invalid active M221 flow multiplier: {flow_percent:g}%")
+    return flow_percent
+
+
+def beginning_of_printing_moves(lines: Sequence[str], start: int, end: int) -> int:
+    """Locate the first XY extrusion, after the layer's Z setup and priming."""
+    for index in range(start, end):
+        command = lines[index].split(";", 1)[0].strip().upper()
+        if not command.startswith(("G0 ", "G1 ")):
+            continue
+        has_xy = re.search(r"(?:^|\s)[XY][-+]?[\d.]+(?:\s|$)", command)
+        extrusion = re.search(r"(?:^|\s)E([-+]?[\d.]+)(?:\s|$)", command)
+        if has_xy and extrusion and float(extrusion.group(1)) > 0:
+            return index
+    raise ValueError("Could not find the first XY extrusion move in this layer")
+
+
+def inject_alternating_paths(
+    source_lines: Sequence[str],
+    name: str,
+    points: Sequence[tuple[float, float]],
+    widths: Sequence[float],
+    segment_multiplicity: Sequence[int],
+    bridge_count: int,
+    filament_diameter_mm: float,
+) -> tuple[list[str], list[tuple[int, float]]]:
+    lines = remove_previous_lineart(source_lines)
+    sections = layer_sections(lines)
+    if not sections:
+        raise ValueError("No ;LAYER_CHANGE markers were found in the host G-code")
+    if START_LAYER < 1 or LAYER_COUNT < 1:
+        raise ValueError("START_LAYER and LAYER_COUNT must both be positive")
+    if INSERTION_POINT not in {"beginning", "end"}:
+        raise ValueError('INSERTION_POINT must be either "beginning" or "end"')
+    first = START_LAYER - 1
+    last = first + LAYER_COUNT
+    if last > len(sections):
+        raise ValueError(
+            f"Requested layers {START_LAYER} through {last}, but the host has only {len(sections)} layer markers"
+        )
+
+    output = list(lines[:sections[0][0]])
+    inserted: list[tuple[int, float]] = []
+    for layer_index, (start, end, height) in enumerate(sections):
+        if not first <= layer_index < last:
+            output.extend(lines[start:end])
+            continue
+        if height is None:
+            raise ValueError(
+                f"Layer {layer_index + 1} has no ;HEIGHT value; cannot calculate width-specific feedrates"
+            )
+        if height <= 0:
+            raise ValueError(f"Layer {layer_index + 1} has invalid height {height:g} mm")
+        insertion_index = (
+            beginning_of_printing_moves(lines, start, end)
+            if INSERTION_POINT == "beginning"
+            else end
+        )
+        flow_percent = host_extrusion_state(lines, insertion_index)
+        direction = "forward" if (layer_index - first) % 2 == 0 else "reverse"
+        snippet = build_gcode(
+            name,
+            points,
+            widths,
+            segment_multiplicity,
+            bridge_count,
+            direction,
+            height,
+            flow_percent,
+            filament_diameter_mm,
+        ).splitlines()
+        output.extend(lines[start:insertion_index])
+        output.extend(snippet)
+        output.extend(lines[insertion_index:end])
+        inserted.append((layer_index + 1, height))
+    return output, inserted
+
+
 def main() -> None:
-    if not INPUT_FILE.is_file():
-        raise FileNotFoundError(f"Input STL not found: {INPUT_FILE.resolve()}")
-    if MIN_EXTRUSION_WIDTH_MM <= 0 or MAX_EXTRUSION_WIDTH_MM < MIN_EXTRUSION_WIDTH_MM:
-        raise ValueError("Set positive widths with MAX_EXTRUSION_WIDTH_MM >= MIN_EXTRUSION_WIDTH_MM")
-    if EXTRUSION_HEIGHT_MM <= 0 or MAX_FLOW_RATE_MM3_S <= 0 or FILAMENT_DIAMETER_MM <= 0:
-        raise ValueError("Extrusion height, maximum flow, and filament diameter must be positive")
-    if PRINT_SPEED_MM_S <= 0 or TRAVEL_SPEED_MM_S <= 0 or MAX_BRIDGE_GAP_MM <= 0:
-        raise ValueError("Print/travel speed and maximum bridge gap must be positive")
-    if not 0 < FLOW_SAFETY_FACTOR <= 1:
+    if not INPUT_STL.is_file():
+        raise FileNotFoundError(f"Input STL not found: {INPUT_STL.resolve()}")
+    if not INPUT_PRINT_FILE.is_file():
+        raise FileNotFoundError(f"Input print file not found: {INPUT_PRINT_FILE.resolve()}")
+    if INPUT_PRINT_FILE.resolve() == OUTPUT_PRINT_FILE.resolve():
+        raise ValueError("OUTPUT_PRINT_FILE must differ from INPUT_PRINT_FILE so the source is preserved")
+    supported_extensions = {".gcode", ".bgcode"}
+    input_extension = INPUT_PRINT_FILE.suffix.lower()
+    output_extension = OUTPUT_PRINT_FILE.suffix.lower()
+    if input_extension not in supported_extensions:
+        raise ValueError("INPUT_PRINT_FILE must have a .gcode or .bgcode extension")
+    if output_extension not in supported_extensions:
+        raise ValueError("OUTPUT_PRINT_FILE must have a .gcode or .bgcode extension")
+    if START_LAYER < 1 or LAYER_COUNT < 1:
+        raise ValueError("START_LAYER and LAYER_COUNT must both be positive")
+    if INSERTION_POINT not in {"beginning", "end"}:
+        raise ValueError('INSERTION_POINT must be either "beginning" or "end"')
+    if MAX_EXTRUSION_WIDTH_MM <= 0:
+        raise ValueError("MAX_EXTRUSION_WIDTH_MM must be positive")
+    if MIN_EXTRUSION_WIDTH_MM is not None and MIN_EXTRUSION_WIDTH_MM <= 0:
+        raise ValueError("MIN_EXTRUSION_WIDTH_MM must be positive when explicitly set")
+    if MAX_FLOW_RATE_MM3_S is not None and MAX_FLOW_RATE_MM3_S <= 0:
+        raise ValueError("MAX_FLOW_RATE_MM3_S must be positive when explicitly set")
+    if PRINT_SPEED_MM_S is not None and PRINT_SPEED_MM_S <= 0:
+        raise ValueError("PRINT_SPEED_MM_S must be positive when explicitly set")
+    if TRAVEL_SPEED_MM_S is not None and TRAVEL_SPEED_MM_S <= 0:
+        raise ValueError("TRAVEL_SPEED_MM_S must be positive when explicitly set")
+    if FLOW_SAFETY_FACTOR is not None and not 0 < FLOW_SAFETY_FACTOR <= 1:
         raise ValueError("FLOW_SAFETY_FACTOR must be in (0, 1]")
+    if not 0 < FLOW_SAFETY_FACTOR_FALLBACK <= 1:
+        raise ValueError("FLOW_SAFETY_FACTOR_FALLBACK must be in (0, 1]")
+    if FILAMENT_DIAMETER_FALLBACK_MM <= 0 or (
+        FILAMENT_DIAMETER_MM_OVERRIDE is not None and FILAMENT_DIAMETER_MM_OVERRIDE <= 0
+    ):
+        raise ValueError("Filament diameter values must be positive")
+    if MAX_BRIDGE_GAP_MM <= 0:
+        raise ValueError("MAX_BRIDGE_GAP_MM must be positive")
     if len(PROJECTION_AXES) != 2 or len(set(PROJECTION_AXES)) != 2 or any(axis not in (0, 1, 2) for axis in PROJECTION_AXES):
         raise ValueError("PROJECTION_AXES must contain two distinct STL axes from 0, 1, 2")
     if (
@@ -774,7 +1437,31 @@ def main() -> None:
     ):
         raise ValueError("Scale and raster/sample resolutions must be positive")
 
-    all_triangles = load_stl(INPUT_FILE)
+    workspace = tempfile.TemporaryDirectory(prefix="lineart-bgcode-")
+    workspace_path = Path(workspace.name)
+    decoded_gcode = workspace_path / "host.gcode"
+    bgcode_metadata: dict[str, object] = {}
+    if input_extension == ".bgcode":
+        bgcode_metadata = read_bgcode_metadata(INPUT_PRINT_FILE)
+        convert_bgcode_to_ascii(INPUT_PRINT_FILE, decoded_gcode)
+        host_text = decoded_gcode.read_text(encoding="utf-8", errors="replace")
+    else:
+        host_text = INPUT_PRINT_FILE.read_text(encoding="utf-8", errors="replace")
+    profile_settings = parse_prusaslicer_settings(host_text, bgcode_metadata)
+    resolve_profile_parameters(profile_settings)
+    if MIN_EXTRUSION_WIDTH_MM is None or MIN_EXTRUSION_WIDTH_MM > MAX_EXTRUSION_WIDTH_MM:
+        raise ValueError("Set positive widths with MAX_EXTRUSION_WIDTH_MM >= MIN_EXTRUSION_WIDTH_MM")
+    if MAX_FLOW_RATE_MM3_S is None or MAX_FLOW_RATE_MM3_S <= 0:
+        raise ValueError("Maximum flow rate must be positive")
+    if PRINT_SPEED_MM_S is None or PRINT_SPEED_MM_S <= 0:
+        raise ValueError("Print speed must be positive")
+    if TRAVEL_SPEED_MM_S is None or TRAVEL_SPEED_MM_S <= 0:
+        raise ValueError("Travel speed must be positive")
+    if FLOW_SAFETY_FACTOR is None or not 0 < FLOW_SAFETY_FACTOR <= 1:
+        raise ValueError("FLOW_SAFETY_FACTOR must be in (0, 1]")
+    filament_diameter_mm = find_filament_diameter(bgcode_metadata, host_text)
+
+    all_triangles = load_stl(INPUT_STL)
     components = split_face_components(all_triangles, VERTEX_WELD_TOLERANCE_MM)
     kept_component_ids = [
         component_id
@@ -809,9 +1496,22 @@ def main() -> None:
     graph_parts = graph_components(adjacency)
     if len(graph_parts) != 1:
         raise ValueError(f"Could not connect all path components; {len(graph_parts)} remain")
+    junction_nodes = [node for node, neighbors in enumerate(adjacency) if len(neighbors) >= 3]
+    junction_pairings = (
+        review_crossing_pairings(
+            skeleton,
+            coordinates,
+            adjacency,
+            junction_nodes,
+            RASTER_PIXELS_PER_MM,
+        )
+        if REVIEW_CROSSINGS_GRAPHICALLY
+        else {}
+    )
     route, _edge_ids, segment_multiplicity, segment_width_overrides, topology_bridges = route_eulerian(
         coordinates,
         adjacency,
+        junction_pairings,
         bottom_start=True,
         distance=distance,
         pixels_per_mm=RASTER_PIXELS_PER_MM,
@@ -868,19 +1568,42 @@ def main() -> None:
             file=sys.stderr,
         )
 
-    base_name = INPUT_FILE.stem
-    forward = build_gcode(base_name, points, widths, segment_multiplicity, bridge_count, "forward")
-    reverse = build_gcode(base_name, points, widths, segment_multiplicity, bridge_count, "reverse")
-    OUTPUT_FORWARD.write_text(forward, encoding="utf-8")
-    OUTPUT_REVERSE.write_text(reverse, encoding="utf-8")
+    base_name = INPUT_STL.stem
+    updated_lines, inserted_layers = inject_alternating_paths(
+        host_text.splitlines(),
+        base_name,
+        points,
+        widths,
+        segment_multiplicity,
+        bridge_count,
+        filament_diameter_mm,
+    )
+    updated_text = "\n".join(updated_lines) + "\n"
+    if output_extension == ".gcode":
+        OUTPUT_PRINT_FILE.write_text(updated_text, encoding="utf-8")
+    else:
+        decoded_gcode.write_text(updated_text, encoding="utf-8")
+        encoded_bgcode = workspace_path / "modified.bgcode"
+        convert_ascii_to_bgcode(decoded_gcode, encoded_bgcode)
+        OUTPUT_PRINT_FILE.write_bytes(encoded_bgcode.read_bytes())
 
     print(f"Input facets: {len(all_triangles)}")
     print(f"Ignored facets/components: {ignored_count} facets ignored")
     print(f"Raster: {mask.shape[1]} x {mask.shape[0]} px at {RASTER_PIXELS_PER_MM:g} px/mm")
     print(f"Path points: {len(points)}; bridges added: {bridge_count}")
     print(f"Projected bounds: {u_max-u_min:.3f} x {v_max-v_min:.3f} mm")
-    print(f"Wrote {OUTPUT_FORWARD.resolve()}")
-    print(f"Wrote {OUTPUT_REVERSE.resolve()}")
+    print(
+        f"Widths: {MIN_EXTRUSION_WIDTH_MM:.3f}–{MAX_EXTRUSION_WIDTH_MM:.3f} mm; "
+        f"flow cap: {MAX_FLOW_RATE_MM3_S:.3f} mm^3/s × {FLOW_SAFETY_FACTOR:.3f}"
+    )
+    print(f"Print speed: {PRINT_SPEED_MM_S:.2f} mm/s; travel speed: {TRAVEL_SPEED_MM_S:.2f} mm/s")
+    print(f"Filament diameter: {filament_diameter_mm:.3f} mm")
+    print("Inserted paths into layers: " + ", ".join(
+        f"{layer} ({height:.3f} mm, {'forward' if offset % 2 == 0 else 'reverse'})"
+        for offset, (layer, height) in enumerate(inserted_layers)
+    ))
+    print(f"Wrote {OUTPUT_PRINT_FILE.resolve()}")
+    workspace.cleanup()
 
 
 if __name__ == "__main__":

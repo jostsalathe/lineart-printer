@@ -18,3 +18,9 @@ htmlcov/
 build/
 dist/
 *.egg-info/
+
+# Local model inputs and printer exports
+*.stl
+*.3mf
+*.gcode
+*.bgcode
