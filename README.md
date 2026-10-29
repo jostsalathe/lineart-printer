@@ -3,6 +3,11 @@
 Convert a swept-line STL into alternating variable-width paths and insert them
 into selected layers of an existing PrusaSlicer ASCII G-code print.
 
+## todos
+
+- The resulting tool path has jagged sections. Some smoothing should be integrated.
+- The whole intput and output selection could be moved to the web GUI.
+
 ## STL swept-line to G-code
 
 Edit the input paths, layer range, maximum width, and XY center at the top of
@@ -18,15 +23,23 @@ The script requires NumPy:
 python3 -m pip install numpy
 ```
 
-On some Linux systems, Tkinter also needs the `python3-tk` system package. The
-tool reads and writes ASCII `.gcode` files directly and leaves the input file
-unchanged.
+Crossing review opens a local browser page. The tool reads and writes ASCII
+`.gcode` files directly and leaves the input file unchanged.
 
 `INPUT_STL` supplies the line geometry. The script projects the mesh, ignores
 small disconnected components such as the integrated pedestal, skeletonizes
-the silhouette, and opens a graphic review for each crossing. Click two
-colored arm tips to say which line ends continue through that crossing. Nearby
-gaps up to `MAX_BRIDGE_GAP_MM` can be joined automatically.
+the silhouette, and opens a browser review for each crossing. Nearby odd-arm
+skeleton junctions are grouped within `MAX_CROSSING_CLUSTER_SPAN_MM` so each
+crossing is presented with an even number of arms. Click two colored arm tips
+to say which line ends continue through that crossing. Nearby gaps up to
+`MAX_BRIDGE_GAP_MM` can be joined automatically. After reviewing all crossings,
+the script verifies that the selected connections make one continuous path.
+If they form multiple trails, the browser review stays open so you can revisit
+any crossing; its previous pairings are restored for editing. A colored
+overview is shown before completion, with a different color and start/end
+markers for each trail. Click numbered crossings in the graphic to edit them. The route is
+checked automatically after the final crossing and whenever an edited crossing
+is saved; a valid overview can then be confirmed to continue.
 
 `INPUT_GCODE_FILE` supplies the host print, including the replacement pedestal;
 `OUTPUT_GCODE_FILE` receives the modified ASCII G-code.
@@ -50,10 +63,15 @@ PrusaSlicer does not export a standard flow safety factor setting. The script
 keeps its own `FLOW_SAFETY_FACTOR` margin (0.98 by default); it can also read a
 custom `flow_safety_factor` G-code comment if one is present.
 
-Set `INSERTION_POINT` to `"beginning"` or `"end"`. The beginning option inserts
-after the layer's Z setup and priming, just before its first XY extrusion move.
-The end option inserts after that layer's existing toolpaths and before the next
-layer marker.
+Forward paths are inserted at the end of their layer, after its existing
+toolpaths and before the next layer marker. Reverse paths are inserted at the
+beginning of the following layer, after its Z setup and priming but before its
+first XY extrusion. This makes each forward/reverse pair directly straddle a
+layer change. If a layer has no existing XY extrusion, its beginning insertion
+falls back to the end of that layer's setup section.
+Each complete pair ends with a non-extruding travel back to the XY position
+where the forward injection began, then restores the host layer's original XY
+resume position. `LAYER_COUNT` must be even so every injection is a complete pair.
 
 The generated routes use absolute XY (`G90`) and relative extrusion (`M83`),
 omit Z moves, and are marked in the G-code so rerunning the script replaces
